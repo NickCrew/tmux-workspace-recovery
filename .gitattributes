@@ -1,0 +1,6 @@
+# Executable entry points must stay LF. CRLF breaks their shebangs.
+*.sh text eol=lf
+*.tmux text eol=lf
+scripts/workspace-recovery text eol=lf
+scripts/tmux-socket-proxy text eol=lf
+*.py text eol=lf

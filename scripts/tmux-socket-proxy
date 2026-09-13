@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# Force tmux-resurrect onto one socket and constrain its tmux command surface.
+
+set -euo pipefail
+
+: "${WORKSPACE_RECOVERY_REAL_TMUX:?missing real tmux path}"
+: "${WORKSPACE_RECOVERY_TMUX_SOCKET:?missing tmux socket path}"
+
+args=()
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+	-S | -L)
+		[ "$#" -ge 2 ] || exit 2
+		shift 2
+		;;
+	*)
+		args+=("$1")
+		shift
+		;;
+	esac
+done
+
+for argument in "${args[@]}"; do
+	if [ "$argument" = ";" ]; then
+		printf 'workspace-recovery: tmux command separators are not allowed\n' >&2
+		exit 1
+	fi
+done
+
+command="${args[0]:-}"
+case "$command" in
+display)
+	args[0]="display-message"
+	command="display-message"
+	;;
+show)
+	args[0]="show-options"
+	command="show-options"
+	;;
+show-option)
+	args[0]="show-options"
+	command="show-options"
+	;;
+switch-client)
+	# Restore server state without moving any attached client.
+	exit 0
+	;;
+-V | capture-pane | display-message | has-session | list-panes | list-sessions | list-windows | \
+	move-window | new-session | new-window | rename-window | resize-pane | select-layout | \
+	select-pane | send-keys | set-option | show-options | show-window-options | split-window)
+	;;
+*)
+	printf 'workspace-recovery: unsupported tmux command: %s\n' "${command:-<empty>}" >&2
+	exit 1
+	;;
+esac
+
+target_session="${WORKSPACE_RECOVERY_TARGET_SESSION:-}"
+if [ -n "$target_session" ]; then
+	for ((index = 1; index < ${#args[@]}; index++)); do
+		case "${args[index]}" in
+		-t | -vt)
+			[ "$((index + 1))" -lt "${#args[@]}" ] || exit 2
+			target="${args[index + 1]}"
+			if [ "$command" = "select-pane" ] && [[ "$target" =~ ^[0-9]+$ ]]; then
+				exit 0
+			fi
+			case "$target" in
+			"$target_session" | "$target_session":*)
+				args[index + 1]="=$target"
+				;;
+			*)
+				printf 'workspace-recovery: rejected cross-session tmux target: %s\n' "$target" >&2
+				exit 1
+				;;
+			esac
+			index=$((index + 1))
+			;;
+		-s)
+			[ "$((index + 1))" -lt "${#args[@]}" ] || exit 2
+			target="${args[index + 1]}"
+			if [ "$command" = "new-session" ]; then
+				[ "$target" = "$target_session" ] || {
+					printf 'workspace-recovery: rejected session creation: %s\n' "$target" >&2
+					exit 1
+				}
+			else
+				case "$target" in
+				"$target_session" | "$target_session":*)
+					args[index + 1]="=$target"
+					;;
+				*)
+					printf 'workspace-recovery: rejected cross-session tmux source: %s\n' "$target" >&2
+					exit 1
+					;;
+				esac
+			fi
+			index=$((index + 1))
+			;;
+		esac
+	done
+fi
+
+if [ "$command" = "show-options" ] && [ "${#args[@]}" -eq 3 ] && \
+	[ "${args[1]}" = "-gqv" ]; then
+	case "${args[2]}" in
+	@resurrect-dir)
+		printf '%s\n' "${WORKSPACE_RECOVERY_RESURRECT_DIR_OVERRIDE:?missing resurrect directory override}"
+		exit 0
+		;;
+	@resurrect-capture-pane-contents)
+		printf 'off\n'
+		exit 0
+		;;
+	@resurrect-never-overwrite)
+		printf 'on\n'
+		exit 0
+		;;
+	@resurrect-hook-post-save-layout | @resurrect-hook-post-save-all | \
+		@resurrect-hook-pre-restore-all | @resurrect-hook-pre-restore-pane-processes | \
+		@resurrect-hook-post-restore-all)
+		exit 0
+		;;
+	@resurrect-processes)
+		if [ -n "${WORKSPACE_RECOVERY_PROCESSES_OVERRIDE:-}" ]; then
+			printf '%s\n' "$WORKSPACE_RECOVERY_PROCESSES_OVERRIDE"
+			exit 0
+		fi
+		;;
+	esac
+fi
+
+if [ -n "${WORKSPACE_RECOVERY_TMUX_LOG:-}" ]; then
+	printf '%q ' "${args[@]}" >>"$WORKSPACE_RECOVERY_TMUX_LOG"
+	printf '\n' >>"$WORKSPACE_RECOVERY_TMUX_LOG"
+fi
+
+case "$command" in
+new-session | new-window | split-window)
+	if [ "${WORKSPACE_RECOVERY_ALLOW_CREATE:-off}" != "on" ]; then
+		printf 'workspace-recovery: tmux creation is disabled for this phase\n' >&2
+		exit 1
+	fi
+	: "${WORKSPACE_RECOVERY_CREATED_LOG:?missing created-object log}"
+	created_format=$'#{session_name}\t#{session_id}\t#{window_id}\t#{pane_id}'
+	for argument in "${args[@]}"; do
+		case "$argument" in
+		-P | -F)
+			printf 'workspace-recovery: creation output options are reserved\n' >&2
+			exit 1
+			;;
+		esac
+	done
+	# Creation and journal append are one interruption boundary. Tmux creation is
+	# short-lived, and the parent gives this block one second before using KILL.
+	trap '' HUP INT TERM
+	created="$("$WORKSPACE_RECOVERY_REAL_TMUX" -S "$WORKSPACE_RECOVERY_TMUX_SOCKET" \
+		"$command" -P -F "$created_format" "${args[@]:1}")"
+	IFS=$'\t' read -r created_session created_session_id created_window_id created_pane_id extra <<<"$created"
+	if [ -z "$created_session" ] || [ -z "$created_session_id" ] || \
+		[ -z "$created_window_id" ] || [ -z "$created_pane_id" ] || [ -n "${extra:-}" ]; then
+		printf 'workspace-recovery: could not identify created tmux object\n' >&2
+		exit 1
+	fi
+	case "$command" in
+	new-session) record=$'pane\t'"$created_session"$'\t'"$created_pane_id" ;;
+	new-window) record=$'pane\t'"$created_session"$'\t'"$created_pane_id" ;;
+	split-window) record=$'pane\t'"$created_session"$'\t'"$created_pane_id" ;;
+	esac
+	if ! printf '%s\n' "$record" >>"$WORKSPACE_RECOVERY_CREATED_LOG"; then
+		"$WORKSPACE_RECOVERY_REAL_TMUX" -S "$WORKSPACE_RECOVERY_TMUX_SOCKET" \
+			kill-pane -t "$created_pane_id" >/dev/null 2>&1 || true
+		exit 1
+	fi
+	trap - HUP INT TERM
+	exit 0
+	;;
+esac
+
+exec "$WORKSPACE_RECOVERY_REAL_TMUX" -S "$WORKSPACE_RECOVERY_TMUX_SOCKET" "${args[@]}"

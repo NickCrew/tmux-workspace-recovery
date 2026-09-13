@@ -1,0 +1,659 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+
+tmux_bin=${TMUX_BIN:-}
+if [[ -z $tmux_bin ]]; then
+  tmux_bin=$(command -v tmux 2>/dev/null || printf 'tmux')
+fi
+if [[ $tmux_bin == */* ]]; then
+  tmux_bin_dir=$(dirname "$tmux_bin")
+  export PATH="$tmux_bin_dir:$PATH"
+fi
+state_dir=${TMUX_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tmux-workspace-recovery/lifecycle}
+snapshot_max_age_overridden=0
+if [[ -n ${TMUX_SAVE_MAX_AGE_SECONDS+x} ]]; then
+  snapshot_max_age_overridden=1
+fi
+snapshot_max_age=${TMUX_SAVE_MAX_AGE_SECONDS:-1200}
+warning_delay=${TMUX_WARNING_DELAY_SECONDS:-3}
+bootstrap_session=__workspace_bootstrap__
+lock_held=0
+
+lock_scope=$(printf '%s' "${TMUX_SOCKET_PATH:-default}" | cksum | awk '{ print $1 }')
+lock_dir=${TMUX_LOCK_DIR:-$HOME/tmp/tmux-workspace-recovery-lifecycle.$lock_scope.lock}
+
+[[ $snapshot_max_age =~ ^[0-9]+$ ]] || {
+  printf 'session-lifecycle: TMUX_SAVE_MAX_AGE_SECONDS must be an integer\n' >&2
+  exit 2
+}
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  session-lifecycle save
+  session-lifecycle prepare SESSION
+  session-lifecycle attach SESSION
+  session-lifecycle health
+USAGE
+}
+
+tmux_command() {
+  if [[ -n ${TMUX_SOCKET_PATH:-} ]]; then
+    "$tmux_bin" -S "$TMUX_SOCKET_PATH" "$@"
+  else
+    "$tmux_bin" "$@"
+  fi
+}
+
+exec_tmux() {
+  if [[ -n ${TMUX_SOCKET_PATH:-} ]]; then
+    exec "$tmux_bin" -S "$TMUX_SOCKET_PATH" "$@"
+  else
+    exec "$tmux_bin" "$@"
+  fi
+}
+
+resurrect_plugin_dir() {
+  local configured=${RESURRECT_PLUGIN_PATH:-}
+  local manager
+  local candidate
+
+  if [[ -z $configured ]] && server_running; then
+    configured=$(tmux_command show-option -gqv @workspace-recovery-resurrect-path)
+  fi
+  if [[ -n $configured ]]; then
+    configured=${configured//\$HOME/$HOME}
+    configured=${configured/#\~/$HOME}
+    [[ -x $configured/scripts/save.sh && -x $configured/scripts/restore.sh ]] || return 1
+    printf '%s\n' "$configured"
+    return
+  fi
+
+  if server_running; then
+    manager=$(tmux_command show-environment -g TMUX_PLUGIN_MANAGER_PATH 2>/dev/null |
+      sed -n 's/^TMUX_PLUGIN_MANAGER_PATH=//p')
+    if [[ -n $manager ]]; then
+      manager=${manager//\$HOME/$HOME}
+      manager=${manager/#\~/$HOME}
+      candidate=${manager%/}/tmux-resurrect
+      if [[ -x $candidate/scripts/save.sh && -x $candidate/scripts/restore.sh ]]; then
+        printf '%s\n' "$candidate"
+        return
+      fi
+    fi
+  fi
+
+  for candidate in \
+    "$HOME/.config/tmux/plugins/tmux-resurrect" \
+    "$HOME/.tmux/plugins/tmux-resurrect"; do
+    if [[ -x $candidate/scripts/save.sh && -x $candidate/scripts/restore.sh ]]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+  return 1
+}
+
+sha256_file() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{ print $1 }'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{ print $1 }'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 -r "$1" | awk '{ print $1 }'
+  else
+    printf 'session-lifecycle: no SHA-256 command is available\n' >&2
+    return 1
+  fi
+}
+
+server_running() {
+  tmux_command list-sessions >/dev/null 2>&1
+}
+
+status_value() {
+  local file=$1
+  local key=$2
+  [[ -r $file ]] || return 1
+  awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$file"
+}
+
+write_status() {
+  local name=$1
+  shift
+  local temporary
+
+  mkdir -p "$state_dir"
+  chmod 700 "$state_dir"
+  temporary=$(mktemp "$state_dir/.${name}.XXXXXX")
+  chmod 600 "$temporary"
+  printf '%s\n' "$@" >"$temporary"
+  mv -f -- "$temporary" "$state_dir/$name"
+}
+
+lock_mtime() {
+  stat -f '%m' "$lock_dir" 2>/dev/null || stat -c '%Y' "$lock_dir" 2>/dev/null
+}
+
+clear_stale_lock() {
+  local owner=
+  local modified=0
+  local now
+
+  [[ -d $lock_dir ]] || return 0
+  if [[ -r $lock_dir/pid ]]; then
+    owner=$(<"$lock_dir/pid")
+  fi
+  if [[ $owner =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
+    return 1
+  fi
+
+  modified=$(lock_mtime || printf '0')
+  now=$(date +%s)
+  if [[ -z $owner && $modified =~ ^[0-9]+$ ]] && (( now - modified < 5 )); then
+    return 1
+  fi
+
+  if [[ -e $lock_dir/pid ]]; then
+    rm -f -- "$lock_dir/pid"
+  fi
+  rmdir "$lock_dir" 2>/dev/null || return 1
+}
+
+release_lock() {
+  if (( lock_held )); then
+    rm -f -- "$lock_dir/pid"
+    rmdir "$lock_dir" 2>/dev/null || true
+    lock_held=0
+  fi
+}
+
+lock_is_active() {
+  local owner=
+  [[ -r $lock_dir/pid ]] || return 1
+  owner=$(<"$lock_dir/pid")
+  [[ $owner =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null
+}
+
+acquire_lock() {
+  local wait_seconds=$1
+  local started=$SECONDS
+
+  mkdir -p "$(dirname "$lock_dir")"
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    clear_stale_lock || true
+    if (( SECONDS - started >= wait_seconds )); then
+      return 1
+    fi
+    sleep 0.1
+  done
+
+  printf '%s\n' "$$" >"$lock_dir/pid"
+  lock_held=1
+  trap release_lock EXIT INT TERM HUP
+}
+
+resurrect_dir() {
+  local configured=${TMUX_RESURRECT_DIR:-}
+  if [[ -z $configured ]] && server_running; then
+    configured=$(tmux_command show-option -gqv @resurrect-dir)
+  fi
+  if [[ -z $configured ]]; then
+    if [[ -d $HOME/.tmux/resurrect ]]; then
+      configured=$HOME/.tmux/resurrect
+    else
+      configured=${XDG_DATA_HOME:-$HOME/.local/share}/tmux/resurrect
+    fi
+  fi
+  configured=${configured//\$HOME/$HOME}
+  configured=${configured/#\~/$HOME}
+  printf '%s\n' "$configured"
+}
+
+validate_snapshot() {
+  local directory=$1
+  local pointer=$directory/last
+  local target
+  local snapshot
+
+  SNAPSHOT_NAME=
+  SNAPSHOT_PATH=
+  [[ -e $pointer || -L $pointer ]] || return 2
+  [[ -L $pointer ]] || return 1
+  target=$(readlink "$pointer")
+  [[ $target != */* ]] || return 1
+  [[ $target =~ ^tmux_resurrect_[0-9]{8}T[0-9]{6}\.txt$ ]] || return 1
+  snapshot=$directory/$target
+  [[ -s $snapshot && -f $snapshot ]] || return 1
+
+  awk -F '\t' '
+    $1 == "pane" {
+      if (NF < 11) exit 2
+      panes++
+    }
+    $1 == "window" {
+      if (NF < 7) exit 2
+      windows++
+    }
+    $1 == "state" { states++ }
+    END {
+      if (panes < 1 || windows < 1 || states < 1) exit 3
+    }
+  ' "$snapshot" || return 1
+
+  SNAPSHOT_NAME=$target
+  SNAPSHOT_PATH=$snapshot
+}
+
+snapshot_mtime() {
+  stat -f '%m' "$1" 2>/dev/null || stat -c '%Y' "$1" 2>/dev/null
+}
+
+snapshot_age() {
+  local snapshot=$1
+  local name=$2
+  local saved_at=
+  local saved_snapshot=
+  local now
+
+  if [[ $(status_value "$state_dir/last-save" result 2>/dev/null || true) == ok ]]; then
+    saved_snapshot=$(status_value "$state_dir/last-save" snapshot 2>/dev/null || true)
+    if [[ $saved_snapshot == "$name" ]]; then
+      saved_at=$(status_value "$state_dir/last-save" timestamp 2>/dev/null || true)
+    fi
+  fi
+  if [[ ! $saved_at =~ ^[0-9]+$ ]]; then
+    saved_at=$(snapshot_mtime "$snapshot")
+  fi
+  now=$(date +%s)
+  printf '%s\n' "$((now - saved_at))"
+}
+
+snapshot_counts() {
+  awk -F '\t' '
+    $1 == "pane" { panes++; sessions[$2] = 1 }
+    $1 == "window" { windows++ }
+    END {
+      for (session in sessions) session_count++
+      printf "sessions=%d\nwindows=%d\npanes=%d\n", session_count, windows, panes
+    }
+  ' "$1"
+}
+
+tmux_environment() {
+  local socket
+  local pid
+  socket=$(tmux_command display-message -p '#{socket_path}')
+  pid=$(tmux_command display-message -p '#{pid}')
+  printf '%s,%s,0\n' "$socket" "$pid"
+}
+
+save_sessions() {
+  local save_script
+  local plugin_dir
+  local directory
+  local environment
+  local now
+  local counts
+  local checksum
+  local server_start
+  local socket
+  local started_at
+
+  started_at=$(date +%s)
+  if ! server_running; then
+    return 0
+  fi
+
+  if ! acquire_lock 0; then
+    return 0
+  fi
+
+  save_script=$(tmux_command show-option -gqv @resurrect-save-script-path)
+  if [[ ! -x $save_script ]]; then
+    plugin_dir=$(resurrect_plugin_dir || true)
+    save_script=${plugin_dir:+$plugin_dir/scripts/save.sh}
+  fi
+  if [[ ! -x $save_script ]]; then
+    write_status last-save-error \
+      "result=failed" \
+      "timestamp=$(date +%s)" \
+      "detail=tmux-resurrect save script is unavailable"
+    return 1
+  fi
+
+  environment=$(tmux_environment)
+  if ! TMUX=$environment "$save_script" quiet >/dev/null 2>&1; then
+    write_status last-save-error \
+      "result=failed" \
+      "timestamp=$(date +%s)" \
+      "detail=tmux-resurrect save command failed"
+    return 1
+  fi
+
+  directory=$(resurrect_dir)
+  if ! validate_snapshot "$directory"; then
+    write_status last-save-error \
+      "result=failed" \
+      "timestamp=$(date +%s)" \
+      "detail=tmux-resurrect produced no valid latest snapshot"
+    return 1
+  fi
+
+  counts=$(snapshot_counts "$SNAPSHOT_PATH")
+  checksum=$(sha256_file "$SNAPSHOT_PATH")
+  server_start=$(tmux_command display-message -p '#{start_time}')
+  socket=$(tmux_command display-message -p '#{socket_path}')
+  now=$(date +%s)
+  write_status last-save \
+    "result=ok" \
+    "timestamp=$now" \
+    "started_at=$started_at" \
+    "max_age=$snapshot_max_age" \
+    "snapshot=$SNAPSHOT_NAME" \
+    "sha256=$checksum" \
+    "socket=$socket" \
+    "server_start=$server_start" \
+    "$counts"
+  rm -f -- "$state_dir/last-save-error"
+}
+
+start_bootstrap_server() {
+  if [[ -n ${TMUX_CONFIG_FILE:-} ]]; then
+    tmux_command -f "$TMUX_CONFIG_FILE" new-session -d -s "$bootstrap_session" -c "$HOME"
+  else
+    tmux_command new-session -d -s "$bootstrap_session" -c "$HOME"
+  fi
+}
+
+wait_for_restore_script() {
+  local attempt
+  local plugin_dir
+  local restore_script
+  for (( attempt = 0; attempt < 100; attempt++ )); do
+    restore_script=$(tmux_command show-option -gqv @resurrect-restore-script-path)
+    if [[ -x $restore_script ]]; then
+      printf '%s\n' "$restore_script"
+      return 0
+    fi
+    sleep 0.05
+  done
+  plugin_dir=$(resurrect_plugin_dir || true)
+  restore_script=${plugin_dir:+$plugin_dir/scripts/restore.sh}
+  if [[ -x $restore_script ]]; then
+    printf '%s\n' "$restore_script"
+    return 0
+  fi
+  return 1
+}
+
+record_restore_status() {
+  local result=$1
+  local detail=$2
+  local snapshot=${3:-none}
+  write_status last-restore \
+    "result=$result" \
+    "timestamp=$(date +%s)" \
+    "snapshot=$snapshot" \
+    "detail=$detail"
+}
+
+restore_saved_sessions() {
+  local directory
+  local restore_script
+  local environment
+  local age
+  local result=ok
+  local detail
+  local validation_status=0
+
+  directory=$(resurrect_dir)
+  if validate_snapshot "$directory"; then
+    :
+  else
+    validation_status=$?
+    if (( validation_status == 2 )); then
+      record_restore_status missing "no saved snapshot exists yet"
+      return 0
+    fi
+    record_restore_status invalid "latest snapshot is missing or invalid"
+    return 1
+  fi
+
+  if ! restore_script=$(wait_for_restore_script); then
+    record_restore_status failed "tmux-resurrect restore script is unavailable" "$SNAPSHOT_NAME"
+    return 1
+  fi
+
+  environment=$(tmux_environment)
+  if ! TMUX=$environment "$restore_script"; then
+    record_restore_status failed "tmux-resurrect restore command failed" "$SNAPSHOT_NAME"
+    return 1
+  fi
+
+  age=$(snapshot_age "$SNAPSHOT_PATH" "$SNAPSHOT_NAME")
+  detail="restored snapshot ${age} seconds old"
+  if (( age > snapshot_max_age )); then
+    result=stale
+  fi
+  record_restore_status "$result" "$detail" "$SNAPSHOT_NAME"
+}
+
+validate_session_name() {
+  [[ $1 =~ ^[[:alnum:]][[:alnum:]_-]*$ ]]
+}
+
+report_restore_warning() {
+  local file=$state_dir/last-restore
+  local result
+  local detail
+  [[ -r $file ]] || return 0
+  result=$(status_value "$file" result || true)
+  [[ $result == ok ]] && return 0
+  detail=$(status_value "$file" detail || true)
+  printf 'tmux restore warning: %s (%s)\n' "$result" "$detail" >&2
+  if [[ $warning_delay =~ ^[0-9]+([.][0-9]+)?$ ]] && [[ $warning_delay != 0 ]]; then
+    sleep "$warning_delay"
+  fi
+}
+
+prepare_session() {
+  local session=$1
+  local started_server=0
+  local restore_state=
+  local restore_failed=0
+
+  validate_session_name "$session" || {
+    printf 'session-lifecycle: unsafe session name: %s\n' "$session" >&2
+    return 2
+  }
+
+  if ! acquire_lock 60; then
+    printf 'session-lifecycle: timed out waiting for workspace preparation\n' >&2
+    return 1
+  fi
+
+  if ! server_running; then
+    start_bootstrap_server
+    started_server=1
+  fi
+
+  restore_state=$(tmux_command show-option -gqv @session-lifecycle-restore-state)
+  if (( started_server )) || {
+    [[ $restore_state != complete ]] &&
+      tmux_command has-session -t "=$bootstrap_session" 2>/dev/null
+  }; then
+    if restore_saved_sessions; then
+      tmux_command set-option -g @session-lifecycle-restore-state complete
+    else
+      restore_failed=1
+      tmux_command set-option -g @session-lifecycle-restore-state failed
+    fi
+  fi
+
+  if (( restore_failed )); then
+    if (( started_server )); then
+      tmux_command kill-server
+    fi
+    release_lock
+    trap - EXIT INT TERM HUP
+    report_restore_warning
+    return 1
+  fi
+
+  if ! tmux_command has-session -t "=$session" 2>/dev/null; then
+    tmux_command new-session -d -s "$session" -c "$HOME"
+  fi
+  if tmux_command has-session -t "=$bootstrap_session" 2>/dev/null; then
+    tmux_command kill-session -t "=$bootstrap_session"
+  fi
+
+  release_lock
+  trap - EXIT INT TERM HUP
+  report_restore_warning
+}
+
+attach_session() {
+  local session=$1
+  prepare_session "$session"
+  exec_tmux new-session -A -s "$session"
+}
+
+health() {
+  local unhealthy=0
+  local result
+  local detail
+  local timestamp
+  local age
+  local directory
+  local saved_socket
+  local saved_server_start
+  local saved_snapshot
+  local saved_checksum
+  local current_checksum
+  local current_socket
+  local current_server_start
+  local error_timestamp
+  local saved_max_age
+  local health_max_age=$snapshot_max_age
+  local save_in_progress=0
+
+  if [[ -r $state_dir/last-restore ]]; then
+    result=$(status_value "$state_dir/last-restore" result || true)
+    detail=$(status_value "$state_dir/last-restore" detail || true)
+    printf 'restore: %s, %s\n' "$result" "$detail"
+    [[ $result == ok || $result == stale || $result == missing ]] || unhealthy=1
+  else
+    printf 'restore: no recorded attempt\n'
+  fi
+
+  if server_running; then
+    if lock_is_active; then
+      save_in_progress=1
+    fi
+    result=$(status_value "$state_dir/last-save" result 2>/dev/null || true)
+    timestamp=$(status_value "$state_dir/last-save" timestamp 2>/dev/null || true)
+    saved_socket=$(status_value "$state_dir/last-save" socket 2>/dev/null || true)
+    saved_server_start=$(status_value "$state_dir/last-save" server_start 2>/dev/null || true)
+    saved_snapshot=$(status_value "$state_dir/last-save" snapshot 2>/dev/null || true)
+    saved_checksum=$(status_value "$state_dir/last-save" sha256 2>/dev/null || true)
+    saved_max_age=$(status_value "$state_dir/last-save" max_age 2>/dev/null || true)
+    if (( ! snapshot_max_age_overridden )) && [[ $saved_max_age =~ ^[0-9]+$ ]]; then
+      health_max_age=$saved_max_age
+    fi
+    error_timestamp=$(status_value "$state_dir/last-save-error" timestamp 2>/dev/null || true)
+    current_socket=$(tmux_command display-message -p '#{socket_path}')
+    current_server_start=$(tmux_command display-message -p '#{start_time}')
+    directory=$(resurrect_dir)
+    if (( save_in_progress )); then
+      if [[ $saved_socket == "$current_socket" &&
+            $saved_server_start == "$current_server_start" &&
+            $result == ok && $timestamp =~ ^[0-9]+$ ]]; then
+        age=$(($(date +%s) - timestamp))
+        if [[ $error_timestamp =~ ^[0-9]+$ ]] && (( error_timestamp >= timestamp )); then
+          detail=$(status_value "$state_dir/last-save-error" detail 2>/dev/null || true)
+          printf 'save: in progress after failure, %s\n' "${detail:-previous save failed}"
+          unhealthy=1
+        elif (( age <= health_max_age )); then
+          printf 'save: in progress, previous success %s seconds ago\n' "$age"
+        else
+          printf 'save: in progress, previous success is stale at %s seconds\n' "$age"
+          unhealthy=1
+        fi
+      else
+        printf 'save: in progress, current tmux server has no completed save yet\n'
+        unhealthy=1
+      fi
+    elif [[ $saved_socket != "$current_socket" ||
+          $saved_server_start != "$current_server_start" ]]; then
+      printf 'save: pending, current tmux server has not been saved yet\n'
+      unhealthy=1
+    elif [[ $result == ok && $timestamp =~ ^[0-9]+$ ]]; then
+      if [[ $error_timestamp =~ ^[0-9]+$ ]] && (( error_timestamp >= timestamp )); then
+        detail=$(status_value "$state_dir/last-save-error" detail 2>/dev/null || true)
+        printf 'save: failed, %s\n' "${detail:-latest scheduled save failed}"
+        unhealthy=1
+      elif ! validate_snapshot "$directory"; then
+        printf 'save: invalid, latest snapshot is missing or malformed\n'
+        unhealthy=1
+      elif [[ $SNAPSHOT_NAME != "$saved_snapshot" ]]; then
+        printf 'save: invalid, latest snapshot does not match success metadata\n'
+        unhealthy=1
+      else
+        current_checksum=$(sha256_file "$SNAPSHOT_PATH")
+        if [[ -z $saved_checksum || $current_checksum != "$saved_checksum" ]]; then
+          printf 'save: invalid, latest snapshot checksum does not match success metadata\n'
+          unhealthy=1
+        else
+          age=$(($(date +%s) - timestamp))
+          if (( age <= health_max_age )); then
+            printf 'save: healthy, last success %s seconds ago\n' "$age"
+          else
+            printf 'save: stale, last success %s seconds ago\n' "$age"
+            unhealthy=1
+          fi
+        fi
+      fi
+    else
+      detail=$(status_value "$state_dir/last-save-error" detail 2>/dev/null || true)
+      printf 'save: %s, %s\n' "${result:-missing}" "${detail:-no successful save recorded}"
+      unhealthy=1
+    fi
+  else
+    directory=$(resurrect_dir)
+    if validate_snapshot "$directory"; then
+      printf 'save: inactive, snapshot available: %s\n' "$SNAPSHOT_NAME"
+    else
+      printf 'save: inactive, no valid snapshot available\n'
+      unhealthy=1
+    fi
+  fi
+
+  return "$unhealthy"
+}
+
+command_name=${1:-}
+case $command_name in
+  save)
+    [[ $# == 1 ]] || { usage >&2; exit 2; }
+    save_sessions
+    ;;
+  prepare)
+    [[ $# == 2 ]] || { usage >&2; exit 2; }
+    prepare_session "$2"
+    ;;
+  attach)
+    [[ $# == 2 ]] || { usage >&2; exit 2; }
+    attach_session "$2"
+    ;;
+  health)
+    [[ $# == 1 ]] || { usage >&2; exit 2; }
+    health
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

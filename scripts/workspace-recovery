@@ -1,0 +1,605 @@
+#!/usr/bin/env bash
+# Preview and restore one session from a tmux-resurrect snapshot.
+
+set -euo pipefail
+umask 077
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SNAPSHOT_HELPER="$SCRIPT_DIR/snapshot.py"
+TMUX_PROXY="$SCRIPT_DIR/tmux-socket-proxy"
+PROCESS_GROUP_LAUNCHER="$SCRIPT_DIR/process-group.py"
+TMUX_SOCKET=""
+TEMP_DIR=""
+PREVIEW_HASH=""
+RESTORE_ACTIVE=0
+ROLLBACK_SESSION=""
+ROLLBACK_WINDOWS=""
+ROLLBACK_PANES=""
+RESTORE_PID=""
+
+usage() {
+	cat <<'EOF'
+usage:
+  workspace-recovery list [--socket PATH]
+  workspace-recovery preview SESSION [--snapshot NAME] [--socket PATH]
+  workspace-recovery restore SESSION [--snapshot NAME] [--socket PATH] [--apply]
+  workspace-recovery pick [--socket PATH]
+  workspace-recovery doctor [--socket PATH]
+
+Snapshots must be inside the configured tmux-resurrect directory. NAME defaults
+to "latest", which resolves the last snapshot link. Restore is a dry run unless
+--apply is present.
+EOF
+}
+
+die() {
+	printf 'error: %s\n' "$1" >&2
+	exit 1
+}
+
+tmux_run() {
+	if [ -n "$TMUX_SOCKET" ]; then
+		tmux -S "$TMUX_SOCKET" "$@"
+	else
+		tmux "$@"
+	fi
+}
+
+tmux_server_available() {
+	command -v tmux >/dev/null 2>&1 && tmux_run list-sessions >/dev/null 2>&1
+}
+
+require_tmux_server() {
+	command -v tmux >/dev/null 2>&1 || die "tmux not found on PATH"
+	tmux_server_available || die "tmux server not available"
+}
+
+tmux_option() {
+	local name="$1" fallback="$2" value
+	value="$(tmux_run show-option -gqv "$name" 2>/dev/null || true)"
+	if [ -n "$value" ]; then printf '%s' "$value"; else printf '%s' "$fallback"; fi
+}
+
+expand_path() {
+	local path="$1" host literal_home literal_hostname tilde_prefix
+	host="$(hostname)"
+	literal_home="$(printf '%c%s' 36 HOME)"
+	literal_hostname="$(printf '%c%s' 36 HOSTNAME)"
+	tilde_prefix="$(printf '%c/' 126)"
+	if [[ "$path" == "$tilde_prefix"* ]]; then path="$HOME/${path#"$tilde_prefix"}"; fi
+	path="${path//$literal_home/$HOME}"
+	path="${path//$literal_hostname/$host}"
+	printf '%s' "$path"
+}
+
+resurrect_data_dir() {
+	local configured
+	configured="$(tmux_option '@resurrect-dir' '')"
+	if [ -n "$configured" ]; then
+		expand_path "$configured"
+	elif [ -d "$HOME/.tmux/resurrect" ]; then
+		printf '%s' "$HOME/.tmux/resurrect"
+	else
+		printf '%s' "${XDG_DATA_HOME:-$HOME/.local/share}/tmux/resurrect"
+	fi
+}
+
+resurrect_plugin_dir() {
+	local configured manager candidate
+	configured="${RESURRECT_PLUGIN_PATH:-$(tmux_option '@workspace-recovery-resurrect-path' '')}"
+	if [ -n "$configured" ]; then
+		configured="$(expand_path "$configured")"
+		if [ ! -x "$configured/scripts/save.sh" ] || [ ! -x "$configured/scripts/restore.sh" ]; then
+			die "invalid tmux-resurrect plugin path: $configured"
+		fi
+		printf '%s' "$configured"
+		return
+	fi
+
+	manager="$(tmux_run show-environment -g TMUX_PLUGIN_MANAGER_PATH 2>/dev/null |
+		sed -n 's/^TMUX_PLUGIN_MANAGER_PATH=//p')"
+	if [ -n "$manager" ]; then
+		manager="$(expand_path "$manager")"
+		candidate="${manager%/}/tmux-resurrect"
+		if [ -x "$candidate/scripts/save.sh" ] && [ -x "$candidate/scripts/restore.sh" ]; then
+			printf '%s' "$candidate"
+			return
+		fi
+	fi
+
+	for candidate in \
+		"$HOME/.config/tmux/plugins/tmux-resurrect" \
+		"$HOME/.tmux/plugins/tmux-resurrect"; do
+		if [ -x "$candidate/scripts/save.sh" ] && [ -x "$candidate/scripts/restore.sh" ]; then
+			printf '%s' "$candidate"
+			return
+		fi
+	done
+	die "tmux-resurrect plugin not found; set @workspace-recovery-resurrect-path"
+}
+
+resolve_snapshot() {
+	local reference="${1:-latest}"
+	python3 "$SNAPSHOT_HELPER" resolve "$(resurrect_data_dir)" "$reference"
+}
+
+cleanup() {
+	if [ -n "$TEMP_DIR" ]; then
+		case "$TEMP_DIR" in
+		"$HOME/tmp/tmux-workspace-recovery."*) rm -rf -- "$TEMP_DIR" ;;
+		esac
+	fi
+}
+
+on_signal() {
+	local status="$1"
+	trap - INT TERM
+	if [ -n "$RESTORE_PID" ]; then
+		kill -TERM -- "-$RESTORE_PID" >/dev/null 2>&1 || true
+		for _ in {1..20}; do
+			kill -0 -- "-$RESTORE_PID" >/dev/null 2>&1 || break
+			sleep 0.05
+		done
+		kill -KILL -- "-$RESTORE_PID" >/dev/null 2>&1 || true
+		wait "$RESTORE_PID" >/dev/null 2>&1 || true
+		RESTORE_PID=""
+	fi
+	if [ "$RESTORE_ACTIVE" -eq 1 ] && [ -n "$ROLLBACK_SESSION" ]; then
+		rollback_target "$ROLLBACK_SESSION" "$ROLLBACK_WINDOWS" "$ROLLBACK_PANES"
+		RESTORE_ACTIVE=0
+	fi
+	exit "$status"
+}
+
+trap cleanup EXIT
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
+
+make_temp_dir() {
+	mkdir -p "$HOME/tmp"
+	TEMP_DIR="$(mktemp -d "$HOME/tmp/tmux-workspace-recovery.XXXXXX")"
+	mkdir "$TEMP_DIR/bin"
+	ln -s "$TMUX_PROXY" "$TEMP_DIR/bin/tmux"
+}
+
+session_exists() {
+	tmux_run has-session -t "=$1" >/dev/null 2>&1
+}
+
+session_is_grouped() {
+	local target="$1" name grouped
+	while IFS=$'\t' read -r name grouped; do
+		if [ "$name" = "$target" ]; then
+			[ "$grouped" = "1" ]
+			return
+		fi
+	done < <(tmux_run list-sessions -F $'#{session_name}\t#{session_grouped}')
+	return 1
+}
+
+window_exists() {
+	local session="$1" window="$2"
+	tmux_run list-windows -t "=$session" -F '#{window_index}' 2>/dev/null |
+		grep -Fxq "$window"
+}
+
+live_pane_count() {
+	local session="$1" window="$2"
+	if ! window_exists "$session" "$window"; then
+		printf '0'
+		return
+	fi
+	tmux_run list-panes -t "=$session:$window" -F '#{pane_index}' | wc -l | tr -d ' '
+}
+
+preview_session() {
+	local session="$1" snapshot="$2"
+	local checksum saved_windows=0 saved_panes=0 live_windows=0 live_panes=0
+	local existing_windows=0 missing_windows=0 missing_panes=0
+	local index name_token name panes current_panes saved_rows
+
+	checksum="$(python3 "$SNAPSHOT_HELPER" checksum "$snapshot")"
+	PREVIEW_HASH="$checksum"
+	saved_rows="$(python3 "$SNAPSHOT_HELPER" windows "$snapshot" "$session")" || return 1
+	while IFS=$'\t' read -r index name_token panes; do
+		[ -n "$index" ] || continue
+		name="$(python3 "$SNAPSHOT_HELPER" decode-text "$name_token")"
+		saved_windows=$((saved_windows + 1))
+		saved_panes=$((saved_panes + panes))
+		if tmux_server_available && window_exists "$session" "$index"; then
+			existing_windows=$((existing_windows + 1))
+			current_panes="$(live_pane_count "$session" "$index")"
+			if [ "$current_panes" -lt "$panes" ]; then
+				missing_panes=$((missing_panes + panes - current_panes))
+			fi
+		else
+			missing_windows=$((missing_windows + 1))
+			missing_panes=$((missing_panes + panes))
+		fi
+	done <<<"$saved_rows"
+
+	if tmux_server_available && session_exists "$session"; then
+		live_windows="$(tmux_run list-windows -t "=$session" -F '#{window_index}' | wc -l | tr -d ' ')"
+		live_panes="$(tmux_run list-panes -s -t "=$session" -F '#{pane_index}' | wc -l | tr -d ' ')"
+	fi
+
+	printf 'Snapshot: %s\n' "$snapshot"
+	printf 'SHA-256:  %s\n' "$checksum"
+	printf 'Session:  %s\n' "$session"
+	printf 'Saved:    %s windows, %s panes\n' "$saved_windows" "$saved_panes"
+	printf 'Live:     %s windows, %s panes\n' "$live_windows" "$live_panes"
+	printf 'Plan:     create %s windows and %s panes; update %s saved window names and layouts\n' \
+		"$missing_windows" "$missing_panes" "$existing_windows"
+	printf 'Scope:    preserve existing panes; exclude every other session\n'
+	printf 'Content:  captured scrollback disabled\n'
+	if [ "$(tmux_option '@workspace-recovery-restore-processes' 'off')" = "on" ]; then
+		printf 'Processes: use the configured @resurrect-processes strategies\n'
+	else
+		printf 'Processes: disabled (set @workspace-recovery-restore-processes on to opt in)\n'
+	fi
+}
+
+other_topology() {
+	local target="$1" tab
+	tab="$(printf '\t')"
+	tmux_run list-panes -a -F \
+		"#{session_name}${tab}#{window_index}${tab}#{window_name}${tab}#{window_layout}${tab}#{pane_index}${tab}#{pane_id}" |
+		awk -F '\t' -v target="$target" '$1 != target' | sort
+}
+
+target_window_state() {
+	local target="$1" delimiter
+	delimiter="$(printf '\037')"
+	if session_exists "$target"; then
+		tmux_run list-windows -t "=$target" -F \
+			"#{window_index}${delimiter}#{window_name}${delimiter}#{window_layout}${delimiter}#{automatic-rename}${delimiter}#{window_zoomed_flag}" |
+			python3 "$SNAPSHOT_HELPER" encode-live-state window | sort -n
+	fi
+}
+
+target_pane_state() {
+	local target="$1" delimiter
+	delimiter="$(printf '\037')"
+	if session_exists "$target"; then
+		tmux_run list-panes -s -t "=$target" -F \
+			"#{pane_id}${delimiter}#{pane_title}${delimiter}#{pane_active}" |
+			python3 "$SNAPSHOT_HELPER" encode-live-state pane | sort
+	fi
+}
+
+rollback_target() {
+	local session="$1" before_windows="$2" before_panes="$3"
+	local kind recorded_session pane_id index name_token name layout automatic zoom title_token title active current_zoom
+	local created_log="$TEMP_DIR/created.tsv"
+	printf 'Restore verification failed; rolling back changes to session %s.\n' "$session" >&2
+
+	if [ -f "$created_log" ]; then
+		while IFS=$'\t' read -r kind recorded_session pane_id; do
+			[ "$kind" = "pane" ] || continue
+			[ "$recorded_session" = "$session" ] || continue
+			if [ "$(tmux_run display-message -p -t "$pane_id" '#{session_name}' 2>/dev/null || true)" = "$session" ]; then
+				tmux_run kill-pane -t "$pane_id" >/dev/null 2>&1 || true
+			fi
+		done <"$created_log"
+	fi
+
+	if ! session_exists "$session"; then
+		return
+	fi
+
+	while IFS=$'\t' read -r index name_token layout automatic zoom; do
+		[ -n "$index" ] || continue
+		name="$(python3 "$SNAPSHOT_HELPER" decode-text "$name_token")"
+		if ! window_exists "$session" "$index"; then
+			continue
+		fi
+		tmux_run rename-window -t "=$session:$index" "$name" >/dev/null 2>&1 || true
+		tmux_run select-layout -t "=$session:$index" "$layout" >/dev/null 2>&1 || true
+		if [ "$automatic" = "on" ]; then
+			tmux_run set-option -w -t "=$session:$index" automatic-rename on >/dev/null 2>&1 || true
+		else
+			tmux_run set-option -w -t "=$session:$index" automatic-rename off >/dev/null 2>&1 || true
+		fi
+		current_zoom="$(tmux_run display-message -p -t "=$session:$index" '#{window_zoomed_flag}' 2>/dev/null || true)"
+		if [ -n "$current_zoom" ] && [ "$current_zoom" != "$zoom" ]; then
+			tmux_run resize-pane -t "=$session:$index" -Z >/dev/null 2>&1 || true
+		fi
+	done <<<"$before_windows"
+
+	while IFS=$'\t' read -r pane_id title_token active; do
+		[ -n "$pane_id" ] || continue
+		title="$(python3 "$SNAPSHOT_HELPER" decode-text "$title_token")"
+		tmux_run select-pane -t "$pane_id" -T "$title" >/dev/null 2>&1 || true
+		if [ "$active" = "1" ]; then
+			tmux_run select-pane -t "$pane_id" >/dev/null 2>&1 || true
+		fi
+	done <<<"$before_panes"
+}
+
+apply_and_verify_target() {
+	local session="$1" filtered="$2" index name_token name panes saved_layout automatic active_pane zoom
+	local current_name current_panes current_layout saved_shape current_shape current_zoom
+	session_exists "$session" || return 1
+	while IFS=$'\t' read -r index name_token panes saved_layout automatic active_pane zoom; do
+		name="$(python3 "$SNAPSHOT_HELPER" decode-text "$name_token")"
+		window_exists "$session" "$index" || return 1
+		current_panes="$(live_pane_count "$session" "$index")"
+		[ "$current_panes" -ge "$panes" ] || return 1
+		if [ "$current_panes" -eq "$panes" ]; then
+			tmux_run select-layout -t "=$session:$index" "$saved_layout" >/dev/null || return 1
+			current_layout="$(tmux_run display-message -p -t "=$session:$index" '#{window_layout}')"
+			saved_shape="$(python3 "$SNAPSHOT_HELPER" layout-shape "$saved_layout")" || return 1
+			current_shape="$(python3 "$SNAPSHOT_HELPER" layout-shape "$current_layout")" || return 1
+			[ "$saved_shape" = "$current_shape" ] || return 1
+		fi
+
+		tmux_run rename-window -t "=$session:$index" "$name" >/dev/null || return 1
+		if [ "$automatic" = ":" ]; then
+			tmux_run set-option -wu -t "=$session:$index" automatic-rename >/dev/null || return 1
+		else
+			tmux_run set-option -w -t "=$session:$index" automatic-rename "$automatic" >/dev/null || return 1
+		fi
+		tmux_run select-pane -t "=$session:$index.$active_pane" >/dev/null || return 1
+		current_zoom="$(tmux_run display-message -p -t "=$session:$index" '#{window_zoomed_flag}')"
+		if [ "$current_zoom" != "$zoom" ]; then
+			tmux_run resize-pane -t "=$session:$index" -Z >/dev/null || return 1
+		fi
+
+		current_name="$(tmux_run display-message -p -t "=$session:$index" '#{window_name}')"
+		[ "$current_name" = "$name" ] || return 1
+		[ "$(tmux_run display-message -p -t "=$session:$index" '#{pane_index}')" = "$active_pane" ] || return 1
+		[ "$(tmux_run display-message -p -t "=$session:$index" '#{window_zoomed_flag}')" = "$zoom" ] || return 1
+	done < <(python3 "$SNAPSHOT_HELPER" properties "$filtered" "$session")
+}
+
+run_proxied() {
+	local script="$1" allow_create="${2:-off}" resurrect_override="$3"
+	local processes_override="${4:-}" process_group="${5:-off}" target_session="${6:-}"
+	local script_argument="${7:-}" real_tmux
+	local -a command_args
+	real_tmux="$(command -v tmux)"
+	if [ "$process_group" = "on" ]; then
+		exec env \
+			PATH="$TEMP_DIR/bin:$PATH" \
+			WORKSPACE_RECOVERY_REAL_TMUX="$real_tmux" \
+			WORKSPACE_RECOVERY_TMUX_SOCKET="$TMUX_SOCKET" \
+			WORKSPACE_RECOVERY_TMUX_LOG="$TEMP_DIR/tmux.log" \
+			WORKSPACE_RECOVERY_CREATED_LOG="$TEMP_DIR/created.tsv" \
+			WORKSPACE_RECOVERY_ALLOW_CREATE="$allow_create" \
+			WORKSPACE_RECOVERY_RESURRECT_DIR_OVERRIDE="$resurrect_override" \
+			WORKSPACE_RECOVERY_PROCESSES_OVERRIDE="$processes_override" \
+			WORKSPACE_RECOVERY_TARGET_SESSION="$target_session" \
+			TMUX="$TMUX_SOCKET,0,0" \
+			python3 "$PROCESS_GROUP_LAUNCHER" "$script"
+	fi
+	command_args=("$script")
+	if [ -n "$script_argument" ]; then
+		command_args+=("$script_argument")
+	fi
+	env PATH="$TEMP_DIR/bin:$PATH" \
+		WORKSPACE_RECOVERY_REAL_TMUX="$real_tmux" \
+		WORKSPACE_RECOVERY_TMUX_SOCKET="$TMUX_SOCKET" \
+		WORKSPACE_RECOVERY_TMUX_LOG="$TEMP_DIR/tmux.log" \
+		WORKSPACE_RECOVERY_CREATED_LOG="$TEMP_DIR/created.tsv" \
+		WORKSPACE_RECOVERY_ALLOW_CREATE="$allow_create" \
+		WORKSPACE_RECOVERY_RESURRECT_DIR_OVERRIDE="$resurrect_override" \
+		WORKSPACE_RECOVERY_PROCESSES_OVERRIDE="$processes_override" \
+		WORKSPACE_RECOVERY_TARGET_SESSION="$target_session" \
+		TMUX="$TMUX_SOCKET,0,0" \
+		"${command_args[@]}"
+}
+
+apply_restore() {
+	local session="$1" snapshot="$2" expected_hash="$3" plugin source_hash current_hash
+	local before_other before_windows before_panes data_dir staged_checkpoint
+	local safety_snapshot safety_hash restore_status after_other processes_override=""
+
+	require_tmux_server
+	if session_exists "$session" && session_is_grouped "$session"; then
+		die "live session $session is grouped; targeted restore is not supported"
+	fi
+	plugin="$(resurrect_plugin_dir)"
+	TMUX_SOCKET="${TMUX_SOCKET:-$(tmux_run display-message -p '#{socket_path}')}"
+	[ -S "$TMUX_SOCKET" ] || die "tmux socket is not a Unix socket: $TMUX_SOCKET"
+	data_dir="$(resurrect_data_dir)"
+
+	make_temp_dir
+	source_hash="$(python3 "$SNAPSHOT_HELPER" checksum "$snapshot")"
+	[ "$source_hash" = "$expected_hash" ] ||
+		die "snapshot changed after preview; review the new plan before applying"
+	cp "$snapshot" "$TEMP_DIR/source"
+	[ "$(python3 "$SNAPSHOT_HELPER" checksum "$TEMP_DIR/source")" = "$source_hash" ] ||
+		die "snapshot changed while the private recovery copy was created"
+	python3 "$SNAPSHOT_HELPER" filter "$TEMP_DIR/source" "$session" "$TEMP_DIR/last"
+	python3 "$SNAPSHOT_HELPER" properties "$TEMP_DIR/last" "$session" >/dev/null
+	current_hash="$(python3 "$SNAPSHOT_HELPER" checksum "$snapshot")"
+	[ "$source_hash" = "$current_hash" ] || die "snapshot changed while the restore plan was built"
+
+	before_other="$(other_topology "$session")"
+	before_windows="$(target_window_state "$session")"
+	before_panes="$(target_pane_state "$session")"
+	ROLLBACK_SESSION="$session"
+	ROLLBACK_WINDOWS="$before_windows"
+	ROLLBACK_PANES="$before_panes"
+
+	mkdir "$TEMP_DIR/checkpoint"
+	printf 'Saving a full-server safety checkpoint...\n'
+	run_proxied "$plugin/scripts/save.sh" off "$TEMP_DIR/checkpoint" '' off '' quiet >/dev/null
+	staged_checkpoint="$(python3 "$SNAPSHOT_HELPER" resolve "$TEMP_DIR/checkpoint" latest)"
+	safety_snapshot="$(python3 "$SNAPSHOT_HELPER" publish-checkpoint "$staged_checkpoint" "$data_dir")"
+	safety_hash="$(python3 "$SNAPSHOT_HELPER" checksum "$safety_snapshot")"
+	current_hash="$(python3 "$SNAPSHOT_HELPER" checksum "$snapshot")"
+	[ "$source_hash" = "$current_hash" ] || die "snapshot changed before restore began"
+
+	if [ "$(tmux_option '@workspace-recovery-restore-processes' 'off')" != "on" ]; then
+		processes_override="false"
+	fi
+	: >"$TEMP_DIR/created.tsv"
+	RESTORE_ACTIVE=1
+
+	printf 'Restoring session %s...\n' "$session"
+	set +e
+	run_proxied "$plugin/scripts/restore.sh" on "$TEMP_DIR" "$processes_override" on "$session" \
+		>/dev/null 2>"$TEMP_DIR/restore.stderr" &
+	RESTORE_PID=$!
+	wait "$RESTORE_PID"
+	restore_status=$?
+	RESTORE_PID=""
+	set -e
+	if [ "$restore_status" -ne 0 ] || ! apply_and_verify_target "$session" "$TEMP_DIR/last"; then
+		rollback_target "$session" "$before_windows" "$before_panes"
+		RESTORE_ACTIVE=0
+		if [ -s "$TEMP_DIR/restore.stderr" ]; then
+			sed -n '1,120p' "$TEMP_DIR/restore.stderr" >&2
+		fi
+		die "restore failed verification; safety checkpoint: $safety_snapshot"
+	fi
+
+	after_other="$(other_topology "$session")"
+	if [ "$before_other" != "$after_other" ]; then
+		printf 'Non-target topology diff:\n' >&2
+		diff -u <(printf '%s\n' "$before_other") <(printf '%s\n' "$after_other") >&2 || true
+		rollback_target "$session" "$before_windows" "$before_panes"
+		RESTORE_ACTIVE=0
+		die "another session changed during restore; target changes were rolled back"
+	fi
+	RESTORE_ACTIVE=0
+
+	printf 'Restore complete.\n'
+	printf 'Safety checkpoint: %s\n' "$safety_snapshot"
+	printf 'Checkpoint SHA-256: %s\n' "$safety_hash"
+	while IFS=$'\t' read -r index name_token panes; do
+		name="$(python3 "$SNAPSHOT_HELPER" decode-text "$name_token")"
+		printf '  window %s: %s (%s panes)\n' "$index" "$name" "$panes"
+	done < <(python3 "$SNAPSHOT_HELPER" windows "$TEMP_DIR/last" "$session")
+}
+
+list_snapshots() {
+	local data file sessions windows panes status
+	data="$(resurrect_data_dir)"
+	[ -d "$data" ] || die "resurrect directory not found: $data"
+	while IFS=$'\t' read -r file sessions windows panes status; do
+		if [ "$status" = "ok" ]; then
+			printf '%s\t%s sessions\t%s windows\t%s panes\n' \
+				"$file" "$sessions" "$windows" "$panes"
+		else
+			printf '%s\t%s\n' "$file" "$status"
+		fi
+	done < <(python3 "$SNAPSHOT_HELPER" list "$data")
+}
+
+parse_session_args() {
+	SESSION=""
+	SNAPSHOT_REF="latest"
+	APPLY=0
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+		--snapshot)
+			[ "$#" -ge 2 ] || die "--snapshot requires a name"
+			SNAPSHOT_REF="$2"
+			shift 2
+			;;
+		--socket)
+			[ "$#" -ge 2 ] || die "--socket requires a path"
+			TMUX_SOCKET="$2"
+			shift 2
+			;;
+		--apply)
+			APPLY=1
+			shift
+			;;
+		-*) die "unknown option: $1" ;;
+		*)
+			[ -z "$SESSION" ] || die "unexpected argument: $1"
+			SESSION="$1"
+			shift
+			;;
+		esac
+	done
+	[ -n "$SESSION" ] || die "session name required"
+}
+
+parse_socket_only() {
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+		--socket)
+			[ "$#" -ge 2 ] || die "--socket requires a path"
+			TMUX_SOCKET="$2"
+			shift 2
+			;;
+		*) die "unknown option: $1" ;;
+		esac
+	done
+}
+
+pick_restore() {
+	local snapshot_row snapshot session_row session confirmation
+	command -v fzf >/dev/null 2>&1 || die "fzf not found on PATH"
+	snapshot_row="$(list_snapshots | fzf --delimiter=$'\t' --with-nth=1.. --reverse --prompt='snapshot> ' --no-multi)" || exit 0
+	snapshot="$(printf '%s' "$snapshot_row" | cut -f1)"
+	snapshot="$(resolve_snapshot "$snapshot")"
+	session_row="$(python3 "$SNAPSHOT_HELPER" sessions "$snapshot" |
+		fzf --delimiter=$'\t' --with-nth=1.. --reverse --prompt='session> ' --no-multi)" || exit 0
+	session="$(printf '%s' "$session_row" | cut -f1)"
+	preview_session "$session" "$snapshot"
+	printf '\nType %s to restore this session: ' "$session"
+	IFS= read -r confirmation || exit 1
+	[ "$confirmation" = "$session" ] || die "confirmation did not match; no changes made"
+	apply_restore "$session" "$snapshot" "$PREVIEW_HASH"
+}
+
+doctor() {
+	local data plugin="not found" socket="not connected"
+	data="$(resurrect_data_dir)"
+	if tmux_server_available; then
+		socket="$(tmux_run display-message -p '#{socket_path}')"
+		plugin="$(resurrect_plugin_dir)"
+	fi
+	printf 'tmux socket:      %s\n' "$socket"
+	printf 'resurrect plugin: %s\n' "$plugin"
+	printf 'snapshot dir:     %s\n' "$data"
+	printf 'pane contents:    disabled during targeted restore\n'
+	printf 'process restore:  %s\n' "$(tmux_option '@workspace-recovery-restore-processes' 'off')"
+}
+
+command="${1:-}"
+[ -n "$command" ] || { usage; exit 2; }
+shift
+
+case "$command" in
+list)
+	parse_socket_only "$@"
+	list_snapshots
+	;;
+preview)
+	parse_session_args "$@"
+	snapshot="$(resolve_snapshot "$SNAPSHOT_REF")"
+	preview_session "$SESSION" "$snapshot"
+	;;
+restore)
+	parse_session_args "$@"
+	snapshot="$(resolve_snapshot "$SNAPSHOT_REF")"
+	preview_session "$SESSION" "$snapshot"
+	if [ "$APPLY" -eq 1 ]; then
+		printf '\n'
+		apply_restore "$SESSION" "$snapshot" "$PREVIEW_HASH"
+	else
+		printf '\nDry run only. Add --apply to execute this plan.\n'
+	fi
+	;;
+pick)
+	parse_socket_only "$@"
+	pick_restore
+	;;
+doctor)
+	parse_socket_only "$@"
+	doctor
+	;;
+-h | --help | help)
+	usage
+	;;
+*)
+	usage >&2
+	exit 2
+	;;
+esac
